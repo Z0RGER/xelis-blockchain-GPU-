@@ -365,20 +365,26 @@ async fn handle_websocket_message(message: Result<Message, TungsteniteError>, jo
     Ok(false)
 }
 
-fn start_thread(id: u8, mut job_receiver: broadcast::Receiver<ThreadNotification<'static>>, block_sender: mpsc::Sender<BlockMiner<'static>>) -> Result<(), Error> {
+fn start_thread(id: u8, mut job_receiver: broadcast::Receiver<ThreadNotification<'static>>, block_sender: mpsc::Sender<BlockMiner<'static>>,block_to_mine: Block,) -> Result<(), Error> {
+    // Initialisation de CUDA avec rustacuda
+    rustacuda::init(CudaFlags::empty()).unwrap();
+    let device = Device::get_device(DeviceOrdinal(0)).unwrap(); //DeviceOrdinal(0) <- 0 pour premier GPU, peut changer l'index pour GPU souhaité
+    device.set_current().unwrap();
+
     let builder = thread::Builder::new().name(format!("Mining Thread #{}", id));
     builder.spawn(move || {
         let mut job: BlockMiner;
         let mut hash: Hash;
-
         let mut scratch_pad = ScratchPad::default();
         info!("Mining Thread #{}: started", id);
         'main: loop {
+            // Charger le bloc à miner sur le GPU en dehors de la boucle de message
+            let block_data = BlockData::load_to_gpu(&block_to_mine).unwrap();
+
             let message = match job_receiver.blocking_recv() {
                 Ok(message) => message,
                 Err(e) => {
                     error!("Error on thread #{} while waiting on new job: {}", id, e);
-                    // Channel is maybe lagging, try to empty it
                     while job_receiver.len() > 1 {
                         let _ = job_receiver.blocking_recv();
                     }
@@ -389,7 +395,6 @@ fn start_thread(id: u8, mut job_receiver: broadcast::Receiver<ThreadNotification
 
             match message {
                 ThreadNotification::WebSocketClosed => {
-                    // wait until we receive a new job, check every 100ms
                     while job_receiver.is_empty() {
                         thread::sleep(Duration::from_millis(100));
                     }
@@ -401,8 +406,6 @@ fn start_thread(id: u8, mut job_receiver: broadcast::Receiver<ThreadNotification
                 ThreadNotification::NewJob(new_job, expected_difficulty, height) => {
                     debug!("Mining Thread #{} received a new job", id);
                     job = new_job;
-                    // set thread id in extra nonce for more work spread between threads
-                    // because it's a u8, it support up to 255 threads
                     job.set_thread_id(id);
 
                     let difficulty_target = match compute_difficulty_target(&expected_difficulty) {
@@ -413,12 +416,23 @@ fn start_thread(id: u8, mut job_receiver: broadcast::Receiver<ThreadNotification
                         }
                     };
 
-                    // Solve block
+                    // Initialiser et lancer le noyau CUDA
+                    let num_threads = 256;
+                    let num_blocks = (block_data.len() + num_threads - 1) / num_threads;
+                    my_kernel<<<num_blocks, num_threads>>>(block_data.gpu_ptr(), other_parameters);
+
+                    // Récupérer les résultats depuis le GPU
+                    let result = block_data.get_results_from_gpu().unwrap();
+
+                    // Envoyer les blocs minés au démon
+                    if let Err(_) = block_sender.blocking_send(result) {
+                        error!("Mining Thread #{}: error while sending block found", id);
+                        continue 'main;
+                    }
+
                     hash = job.get_pow_hash(&mut scratch_pad).unwrap();
                     while !check_difficulty_against_target(&hash, &difficulty_target) {
                         job.increase_nonce().unwrap();
-                        // check if we have a new job pending
-                        // Only update every N iterations to avoid too much CPU usage
                         if job.nonce() % UPDATE_EVERY_NONCE == 0 {
                             if !job_receiver.is_empty() {
                                 continue 'main;
@@ -426,11 +440,9 @@ fn start_thread(id: u8, mut job_receiver: broadcast::Receiver<ThreadNotification
                             job.set_timestamp(get_current_time_in_millis()).unwrap();
                             HASHRATE_COUNTER.fetch_add(UPDATE_EVERY_NONCE as usize, Ordering::SeqCst);
                         }
-
                         hash = job.get_pow_hash(&mut scratch_pad).unwrap();
                     }
 
-                    // compute the reference hash for easier finding of the block
                     let block_hash = job.hash();
                     info!("Thread #{}: block {} found at height {} with difficulty {}", id, block_hash, height, format_difficulty(difficulty_from_hash(&hash)));
                     if let Err(_) = block_sender.blocking_send(job) {
@@ -444,6 +456,8 @@ fn start_thread(id: u8, mut job_receiver: broadcast::Receiver<ThreadNotification
     })?;
     Ok(())
 }
+
+
 
 async fn run_prompt(prompt: ShareablePrompt) -> Result<()> {
     let command_manager = CommandManager::new(prompt.clone());
