@@ -22,5 +22,4 @@ anyhow = "1"
 fern = { version = "0.6", features = ["colored"] }
 rand = "0.8.4"
 
-[dependencies]
 rustacuda = "0.5.0"
